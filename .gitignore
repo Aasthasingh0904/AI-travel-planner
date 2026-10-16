@@ -1,0 +1,4 @@
+.streamlit/secrets.toml
+trips.json
+__pycache__/
+.env
