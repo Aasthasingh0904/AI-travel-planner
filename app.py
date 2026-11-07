@@ -25,7 +25,7 @@ INTERESTS = [
 ]
 
 # If you get a "model not found" error, copy the current Flash model name from Google AI Studio
-MODEL = "gemini-flash-latest"
+MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest", "gemini-flash-lite-latest"]  # tried in order
 
 
 # ---------- STORAGE HELPERS ----------
@@ -67,18 +67,68 @@ def strip_fences(text):
     return re.sub(r"```json\s*|```\s*", "", text).strip()
 
 
+def discover_models(client):
+    """Ask the API which Flash models this key can actually use (names change over time)."""
+    found = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            skip = ("image", "tts", "audio", "live", "embedding", "robotics", "computer")
+            if "flash" in name and "generateContent" in actions and not any(k in name for k in skip):
+                found.append(name)
+    except Exception:
+        pass
+    found.sort(key=lambda n: ("lite" in n, "preview" in n or "exp" in n, n))
+    return found
+
+
+def _try_model(client, model, prompt):
+    """Returns parsed JSON, or raises. Retries temporary overloads. Raises LookupError if model missing."""
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=8192,
+                ),
+            )
+            return json.loads(strip_fences(response.text))
+        except Exception as e:
+            msg = str(e)
+            if "404" in msg or "NOT_FOUND" in msg:
+                raise LookupError(msg)
+            if "503" in msg or "UNAVAILABLE" in msg or "429" in msg:
+                last_error = e
+                time.sleep(2 * (attempt + 1))  # wait 2s, 4s, 6s then retry
+                continue
+            raise
+    raise last_error
+
+
 def call_claude(prompt):
-    """Name kept so the rest of the app is unchanged; this now calls Gemini."""
+    """Name kept so the rest of the app is unchanged; this now calls Gemini.
+    Tries the preferred models, retries temporary overloads, and if none of the
+    names exist it asks the API which models are available and uses those."""
     client = get_client()
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            max_output_tokens=8192,
-        ),
-    )
-    return json.loads(strip_fences(response.text))
+    last_error = None
+    tried = set()
+    for model in MODELS + [None]:  # None = switch to auto-discovered models
+        candidates = [model] if model else discover_models(client)
+        for name in candidates:
+            if name in tried:
+                continue
+            tried.add(name)
+            try:
+                return _try_model(client, name, prompt)
+            except LookupError as e:
+                last_error = e  # model name not available, try the next one
+            except Exception as e:
+                last_error = e  # overloaded or other failure, try the next model
+    raise last_error or RuntimeError("No Gemini model available for this API key.")
 
 
 def build_prompt(destination, budget_label, days, interests):
